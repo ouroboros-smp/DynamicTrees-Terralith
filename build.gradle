@@ -37,6 +37,106 @@ sourceSets.main.resources {
     srcDir 'src/generated/resources'
 }
 
+def fabric26ResourcesDir = layout.buildDirectory.dir('generated/fabric26Resources')
+
+tasks.register('prepareFabric26ModelResources') {
+    description = 'Translates legacy add-on tree models into Fabric 26.2 custom block states and item definitions.'
+    inputs.dir('src/generated/resources')
+    inputs.dir('src/main/resources')
+    outputs.dir(fabric26ResourcesDir)
+
+    doLast {
+        def sourceRoot = file('src/generated/resources')
+        def outputRoot = fabric26ResourcesDir.get().asFile
+        copy {
+            from 'src/main/resources'
+            from sourceRoot
+            into outputRoot
+        }
+
+        fileTree(new File(outputRoot, 'assets')) {
+            include '**/models/block/**/*.json'
+        }.each { modelFile ->
+            def path = modelFile.toPath()
+            def assetsIndex = path.iterator().toList().findIndexOf { it.toString() == 'assets' }
+            def namespace = path.getName(assetsIndex + 1).toString()
+            def namespaceAssets = new File(outputRoot, "assets/${namespace}")
+            def model = new groovy.json.JsonSlurper().parse(modelFile)
+            if (!(model.loader in ['dynamictrees:branch', 'dynamictrees:surface_root'])) return
+
+            def relativeModelPath = new File(namespaceAssets, 'models/block').toPath().relativize(modelFile.toPath()).toString().replace('\\', '/')
+            def modelId = relativeModelPath[0..<-5]
+            def blockStateFile = new File(namespaceAssets, "blockstates/${modelId}.json")
+            def blockState = [variants: ['': new LinkedHashMap(model)]]
+            blockState.variants[''].remove('loader')
+            blockState.variants['']['fabric:type'] = model.loader
+            if (model.loader == 'dynamictrees:branch') {
+                def branchId = modelId.tokenize('/').last()
+                def familyId = branchId.replaceFirst('^stripped_', '').replaceFirst('_branch$', '')
+                blockState.variants['']['family'] = "${namespace}:${familyId}"
+            }
+            blockStateFile.parentFile.mkdirs()
+            blockStateFile.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(blockState)) + System.lineSeparator()
+            modelFile.delete()
+        }
+
+        def assets = new File(outputRoot, 'assets/dtterralith')
+        def itemsDir = new File(assets, 'items')
+        itemsDir.mkdirs()
+        fileTree(new File(assets, 'models/item')) {
+            include '*.json'
+        }.each { modelFile ->
+            def itemId = modelFile.name.substring(0, modelFile.name.length() - '.json'.length())
+            def definition = [model: [type: 'minecraft:model', model: "dtterralith:item/${itemId}"]]
+            new File(itemsDir, modelFile.name).text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(definition)) + System.lineSeparator()
+        }
+    }
+}
+
+sourceSets.main.resources.setSrcDirs([fabric26ResourcesDir])
+tasks.named('processResources') {
+    dependsOn tasks.named('prepareFabric26ModelResources')
+}
+tasks.named('sourcesJar') {
+    dependsOn tasks.named('prepareFabric26ModelResources')
+}
+
+tasks.register('verifyFabric26ModelResources') {
+    group = 'verification'
+    description = 'Checks that add-on tree models use Fabric 26.2 block states and item definitions.'
+
+    dependsOn tasks.named('prepareFabric26ModelResources')
+    def generatedAssetsRoot = fabric26ResourcesDir.map { it.dir('assets').asFile }
+    inputs.dir(fabric26ResourcesDir)
+
+    doLast {
+        def assetsRoot = generatedAssetsRoot.get()
+        def namespaceAssets = new File(assetsRoot, 'dtterralith')
+        def legacyModels = fileTree(assetsRoot) {
+            include '**/models/block/**/*.json'
+        }.findAll { file ->
+            def json = new groovy.json.JsonSlurper().parse(file)
+            json.loader?.toString()?.startsWith('dynamictrees:')
+        }
+        if (!legacyModels.empty) {
+            throw new GradleException("Legacy Dynamic Trees block-model loaders remain: ${legacyModels*.path.join(', ')}")
+        }
+
+        def missingItemDefinitions = fileTree(new File(namespaceAssets, 'models/item')) {
+            include '*.json'
+        }.findAll { file ->
+            !new File(namespaceAssets, "items/${file.name}").isFile()
+        }
+        if (!missingItemDefinitions.empty) {
+            throw new GradleException("Minecraft 26.2 item definitions are missing: ${missingItemDefinitions*.name.join(', ')}")
+        }
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('verifyFabric26ModelResources')
+}
+
 processResources {
     inputs.properties([
             mod_id: mod_id,
